@@ -1,0 +1,5 @@
+{
+  "name": "AuditAI - Auditoria Fiscal de Devoluções",
+  "description": "Módulo inteligente para auditoria e cruzamento de dados entre Notas Fiscais de Origem (NFO) e Devolução (NFD).",
+  "requestFramePermissions": []
+}
