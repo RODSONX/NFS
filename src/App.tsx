@@ -15,7 +15,8 @@ import {
   ArrowRight,
   Info,
   AlertTriangle,
-  FileCheck
+  FileCheck,
+  X
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
@@ -32,8 +33,12 @@ interface AuditItem {
   valor_unitario_origem: number;
   icms_valor_devolucao?: number;
   icms_valor_origem?: number;
+  icms_aliquota_devolucao?: number;
+  icms_aliquota_origem?: number;
   ipi_valor_devolucao?: number;
   ipi_valor_origem?: number;
+  ipi_aliquota_devolucao?: number;
+  ipi_aliquota_origem?: number;
   desconto_valor_devolucao?: number;
   desconto_valor_origem?: number;
   status_item: 'OK' | 'ERRO';
@@ -86,7 +91,7 @@ export default function App() {
   const [isAuditing, setIsAuditing] = useState(false);
   const [result, setResult] = useState<AuditResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [files, setFiles] = useState<{ nfo: File | null; nfd: File | null }>({ nfo: null, nfd: null });
+  const [files, setFiles] = useState<{ nfo: File[]; nfd: File[] }>({ nfo: [], nfd: [] });
   
   const nfoInputRef = useRef<HTMLInputElement>(null);
   const nfdInputRef = useRef<HTMLInputElement>(null);
@@ -104,7 +109,7 @@ export default function App() {
   };
 
   const handleAudit = async () => {
-    if (!files.nfo || !files.nfd) {
+    if (files.nfo.length === 0 || files.nfd.length === 0) {
       setError("Por favor, anexe ambos os arquivos (NFO e NFD) antes de auditar.");
       return;
     }
@@ -114,8 +119,17 @@ export default function App() {
     setError(null);
 
     try {
-      const nfoBase64 = await fileToBase64(files.nfo);
-      const nfdBase64 = await fileToBase64(files.nfd);
+      const nfoParts = await Promise.all(
+        files.nfo.map(async (file) => ({
+          inlineData: { mimeType: "application/pdf", data: await fileToBase64(file) }
+        }))
+      );
+      
+      const nfdParts = await Promise.all(
+        files.nfd.map(async (file) => ({
+          inlineData: { mimeType: "application/pdf", data: await fileToBase64(file) }
+        }))
+      );
 
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
@@ -123,33 +137,23 @@ export default function App() {
           {
             parts: [
               {
-                text: `Analise NFO e NFD anexadas.
+                text: `ATENÇÃO LEIA TODAS AS PÁGINAS ATÉ O FINAL. Analise as NFOs e NFDs anexadas. IMPRESCINDÍVEL: Extraia ABSOLUTAMENTE TODOS os itens (ex: 14 ou mais produtos) listados em todas as páginas das notas da primeira até a última. Você é uma IA de alta precisão de extração, NÃO pare a leitura no meio das tabelas de itens, não resuma e não abrevie.
                 Regras: 
-                1. Cruzar itens (SKU/EAN/Desc).
-                2. Qtd NFD <= Qtd NFO.
-                3. Vlr Unit NFD == Vlr Unit NFO.
-                4. Impostos (ICMS/IPI) e Descontos: Devem ser proporcionais à devolução. Extraia os valores de origem (NFO) e devolução (NFD) de ICMS, IPI e Desconto por item.
-                5. Participantes: Extraia Razão Social, CNPJ, Cidade e Endereço de Remetente e Destinatário de ambos os documentos. Validar se na NFD correspondem inversamente à NFO.
-                6. Transportadora: Extraia Razão Social, CNPJ e Endereço da transportadora de ambos os documentos. Verifique se são a mesma ou se há divergência.
-                Retorne JSON.`
+                1. Cruzamento Obrigatório NFD vs NFO: A correspondência dos itens DEVE SER ESTRITAMENTE EXATA com base no "Código do Produto" ou "Referência" impressa na linha de cada produto. Exemplo: A referência "141107-12" na NFD NÃO PODE JAMAIS ser vinculada ou mapeada para "141107-01" na NFO. É estritamente PROIBIDO o cruzamento frouxo ou aproximado baseado em descrição parcial. Se o código exato do produto listado na NFD NÃO EXISTIR em NENHUMA NFO, você DEVE, impreterivelmente: listar este item da NFD na resposta, colocar todos os seus valores de origem (NFO) como 0, definir 'status_item' como "ERRO", e adicionar um alerta claro em 'divergencias_encontradas' (Ex: "Referência 141107-12 presente na devolução não foi encontrada em nenhuma nota de origem").
+                2. Validação de Quantidades: Qtd NFD <= Qtd NFO. Se a Qtd da Devolução (NFD) for maior que a Origem (NFO), 'status_item' DEVE ser "ERRO" e apontado nas divergências.
+                3. Vlr Unit NFD == Vlr Unit NFO. EXTREMAMENTE IMPORTANTE: Extraia EXATAMENTE o "Valor Unitário" (Vlr. Unit.) da coluna dos itens da Nota Fiscal, SEM somar ou embutir no preço do produto IPI, ST, Frete, Seguro ou Despesas Acessórias. O valor unitário deve ser estritamente o valor originário e puro listado na coluna de itens. Se houver divergência, defina 'status_item' = "ERRO" e aponte a divergência.
+                4. Impostos (ICMS/IPI) e Descontos: ATENÇÃO! Extraia o VALOR UNITÁRIO do imposto em Reais (R$) para cada item (ou seja, Valor Total do ICMS do item dividido pela sua respectiva quantidade). Faça o mesmo para IPI e Desconto (sempre informando Valor Unitário R$). Extraia também a Alíquota de ICMS (%) e Alíquota de IPI (%) aplicadas informadas para cada item.
+                5. Participantes: Extraia Razão Social, CNPJ, Cidade e Endereço de Remetente e Destinatário dos documentos. Validar se na NFD correspondem inversamente à NFO.
+                6. Transportadora: Extraia Razão Social, CNPJ e Endereço da transportadora dos documentos. COMPARAÇÃO ESTRITA E CEGA: Se a string da Razão Social ou o CNPJ for DIFERENTE entre a NFO e NFD (por exemplo, "TNT" vs "TOMASI" ou qualquer outra diferença), você DEVE OBRIGATORIAMENTE apontar divergência (conferência_ok: false). Você está PROIBIDA de justificar exceções logísticas ou usar heurísticas de "mesmo grupo". Textos diferentes = false!
+                Retorne JSON apenas e exclusivamente.`
               },
-              {
-                inlineData: {
-                  mimeType: "application/pdf",
-                  data: nfoBase64
-                }
-              },
-              {
-                inlineData: {
-                  mimeType: "application/pdf",
-                  data: nfdBase64
-                }
-              }
+              ...nfoParts,
+              ...nfdParts
             ]
           }
         ],
         config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
@@ -173,8 +177,12 @@ export default function App() {
                     valor_unitario_origem: { type: Type.NUMBER },
                     icms_valor_devolucao: { type: Type.NUMBER },
                     icms_valor_origem: { type: Type.NUMBER },
+                    icms_aliquota_devolucao: { type: Type.NUMBER },
+                    icms_aliquota_origem: { type: Type.NUMBER },
                     ipi_valor_devolucao: { type: Type.NUMBER },
                     ipi_valor_origem: { type: Type.NUMBER },
+                    ipi_aliquota_devolucao: { type: Type.NUMBER },
+                    ipi_aliquota_origem: { type: Type.NUMBER },
                     desconto_valor_devolucao: { type: Type.NUMBER },
                     desconto_valor_origem: { type: Type.NUMBER },
                     status_item: { type: Type.STRING, enum: ["OK", "ERRO"] }
@@ -261,9 +269,17 @@ export default function App() {
   };
 
   const handleFileChange = (type: 'nfo' | 'nfd', e: ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0] || null;
-    setFiles(prev => ({ ...prev, [type]: file }));
+    const selectedFiles = Array.from(e.target.files || []);
+    if (selectedFiles.length > 0) {
+      setFiles(prev => ({ ...prev, [type]: [...prev[type], ...selectedFiles] }));
+    }
     setError(null);
+    e.target.value = '';
+  };
+
+  const handleClearFiles = (type: 'nfo' | 'nfd', e: React.MouseEvent) => {
+    e.stopPropagation();
+    setFiles(prev => ({ ...prev, [type]: [] }));
   };
 
   return (
@@ -279,9 +295,6 @@ export default function App() {
               <h1 className="text-xl font-bold text-slate-900 tracking-tight">ConfNF</h1>
               <p className="text-xs text-slate-500 font-medium uppercase tracking-wider">Módulo de conferencia fiscal</p>
             </div>
-          </div>
-          <div className="hidden sm:flex items-center gap-4 text-sm text-slate-500">
-            <span className="flex items-center gap-1"><Info className="w-4 h-4" /> Suporte: 0800-AUDIT</span>
           </div>
         </div>
       </header>
@@ -304,27 +317,39 @@ export default function App() {
                   ref={nfoInputRef}
                   className="hidden" 
                   accept=".pdf"
+                  multiple
                   onChange={(e) => handleFileChange('nfo', e)}
                 />
-                <div 
-                  onClick={() => nfoInputRef.current?.click()}
-                  className={`border-2 border-dashed rounded-xl p-4 flex flex-col items-center justify-center gap-3 transition-all cursor-pointer h-32 text-center ${
-                    files.nfo 
-                      ? 'border-blue-500 bg-blue-50' 
-                      : 'border-slate-200 hover:border-blue-400 hover:bg-blue-50/50'
-                  }`}
-                >
-                  <div className={`p-2 rounded-full transition-transform group-hover:scale-110 ${
-                    files.nfo ? 'bg-blue-600 text-white' : 'bg-blue-100 text-blue-600'
-                  }`}>
-                    {files.nfo ? <FileCheck className="w-5 h-5" /> : <FileText className="w-5 h-5" />}
+                <div className="relative h-32">
+                  <div 
+                    onClick={() => nfoInputRef.current?.click()}
+                    className={`h-full border-2 border-dashed rounded-xl p-4 flex flex-col items-center justify-center gap-3 transition-all cursor-pointer text-center ${
+                      files.nfo.length > 0 
+                        ? 'border-blue-500 bg-blue-50' 
+                        : 'border-slate-200 hover:border-blue-400 hover:bg-blue-50/50'
+                    }`}
+                  >
+                    <div className={`p-2 rounded-full transition-transform group-hover:scale-110 ${
+                      files.nfo.length > 0 ? 'bg-blue-600 text-white' : 'bg-blue-100 text-blue-600'
+                    }`}>
+                      {files.nfo.length > 0 ? <FileCheck className="w-5 h-5" /> : <FileText className="w-5 h-5" />}
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-700">Nota Fiscal de Origem</p>
+                      <p className="text-xs text-slate-400 mt-1 truncate max-w-[250px]">
+                        {files.nfo.length > 0 ? `${files.nfo.length} arquivo(s) selecionado(s)` : '(NFO - Venda)'}
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-sm font-semibold text-slate-700">Nota Fiscal de Origem</p>
-                    <p className="text-xs text-slate-400 mt-1 truncate max-w-[250px]">
-                      {files.nfo ? files.nfo.name : '(NFO - Venda)'}
-                    </p>
-                  </div>
+                  {files.nfo.length > 0 && (
+                    <button 
+                      onClick={(e) => handleClearFiles('nfo', e)}
+                      className="absolute top-2 right-2 bg-red-100 hover:bg-red-200 text-red-600 p-1.5 rounded-full transition-colors"
+                      title="Limpar arquivos"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -335,27 +360,39 @@ export default function App() {
                   ref={nfdInputRef}
                   className="hidden" 
                   accept=".pdf"
+                  multiple
                   onChange={(e) => handleFileChange('nfd', e)}
                 />
-                <div 
-                  onClick={() => nfdInputRef.current?.click()}
-                  className={`border-2 border-dashed rounded-xl p-4 flex flex-col items-center justify-center gap-3 transition-all cursor-pointer h-32 text-center ${
-                    files.nfd 
-                      ? 'border-emerald-500 bg-emerald-50' 
-                      : 'border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50'
-                  }`}
-                >
-                  <div className={`p-2 rounded-full transition-transform group-hover:scale-110 ${
-                    files.nfd ? 'bg-emerald-600 text-white' : 'bg-emerald-100 text-emerald-600'
-                  }`}>
-                    {files.nfd ? <FileCheck className="w-5 h-5" /> : <RotateCcw className="w-5 h-5" />}
+                <div className="relative h-32">
+                  <div 
+                    onClick={() => nfdInputRef.current?.click()}
+                    className={`h-full border-2 border-dashed rounded-xl p-4 flex flex-col items-center justify-center gap-3 transition-all cursor-pointer text-center ${
+                      files.nfd.length > 0 
+                        ? 'border-emerald-500 bg-emerald-50' 
+                        : 'border-slate-200 hover:border-emerald-400 hover:bg-emerald-50/50'
+                    }`}
+                  >
+                    <div className={`p-2 rounded-full transition-transform group-hover:scale-110 ${
+                      files.nfd.length > 0 ? 'bg-emerald-600 text-white' : 'bg-emerald-100 text-emerald-600'
+                    }`}>
+                      {files.nfd.length > 0 ? <FileCheck className="w-5 h-5" /> : <RotateCcw className="w-5 h-5" />}
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-slate-700">Nota Fiscal de Devolução</p>
+                      <p className="text-xs text-slate-400 mt-1 truncate max-w-[250px]">
+                        {files.nfd.length > 0 ? `${files.nfd.length} arquivo(s) selecionado(s)` : '(NFD - Retorno)'}
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-sm font-semibold text-slate-700">Nota Fiscal de Devolução</p>
-                    <p className="text-xs text-slate-400 mt-1 truncate max-w-[250px]">
-                      {files.nfd ? files.nfd.name : '(NFD - Retorno)'}
-                    </p>
-                  </div>
+                  {files.nfd.length > 0 && (
+                    <button 
+                      onClick={(e) => handleClearFiles('nfd', e)}
+                      className="absolute top-2 right-2 bg-red-100 hover:bg-red-200 text-red-600 p-1.5 rounded-full transition-colors"
+                      title="Limpar arquivos"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -369,7 +406,7 @@ export default function App() {
 
             <button 
               onClick={handleAudit}
-              disabled={isAuditing || !files.nfo || !files.nfd}
+              disabled={isAuditing || files.nfo.length === 0 || files.nfd.length === 0}
               className="w-full mt-6 bg-slate-900 text-white py-3 rounded-xl font-bold flex items-center justify-center gap-3 transition-all hover:bg-slate-800 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-slate-200"
             >
               {isAuditing ? (
@@ -448,9 +485,6 @@ export default function App() {
                     <h3 className="text-2xl font-black uppercase tracking-tight">
                       Análise {result.analise_geral}
                     </h3>
-                    <p className="text-slate-700 mt-1 font-medium leading-relaxed">
-                      {result.resumo_auditoria}
-                    </p>
                     
                     {/* Participant & Tax Summary */}
                     <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -647,11 +681,11 @@ export default function App() {
                             <td className="px-2 py-3 text-xs font-medium text-slate-400">R$ {item.valor_unitario_origem.toFixed(2)}</td>
                             <td className="px-2 py-3 text-xs font-bold text-slate-800 border-r border-slate-100">R$ {item.valor_unitario_devolucao.toFixed(2)}</td>
                             
-                            <td className="px-2 py-3 text-xs font-medium text-blue-300">R$ {item.icms_valor_origem?.toFixed(2) || '0.00'}</td>
-                            <td className="px-2 py-3 text-xs font-bold text-blue-700 border-r border-slate-100">R$ {item.icms_valor_devolucao?.toFixed(2) || '0.00'}</td>
+                            <td className="px-2 py-3 text-xs font-medium text-blue-300 whitespace-nowrap">R$ {item.icms_valor_origem?.toFixed(2) || '0.00'}<br/><span className="text-[9px] font-bold text-blue-400">({item.icms_aliquota_origem || 0}%)</span></td>
+                            <td className="px-2 py-3 text-xs font-bold text-blue-700 border-r border-slate-100 whitespace-nowrap">R$ {item.icms_valor_devolucao?.toFixed(2) || '0.00'}<br/><span className="text-[9px]">({item.icms_aliquota_devolucao || 0}%)</span></td>
                             
-                            <td className="px-2 py-3 text-xs font-medium text-emerald-300">R$ {item.ipi_valor_origem?.toFixed(2) || '0.00'}</td>
-                            <td className="px-2 py-3 text-xs font-bold text-emerald-700 border-r border-slate-100">R$ {item.ipi_valor_devolucao?.toFixed(2) || '0.00'}</td>
+                            <td className="px-2 py-3 text-xs font-medium text-emerald-300 whitespace-nowrap">R$ {item.ipi_valor_origem?.toFixed(2) || '0.00'}<br/><span className="text-[9px] font-bold text-emerald-400">({item.ipi_aliquota_origem || 0}%)</span></td>
+                            <td className="px-2 py-3 text-xs font-bold text-emerald-700 border-r border-slate-100 whitespace-nowrap">R$ {item.ipi_valor_devolucao?.toFixed(2) || '0.00'}<br/><span className="text-[9px]">({item.ipi_aliquota_devolucao || 0}%)</span></td>
                             
                             <td className="px-2 py-3 text-xs font-medium text-rose-300">R$ {item.desconto_valor_origem?.toFixed(2) || '0.00'}</td>
                             <td className="px-2 py-3 text-xs font-bold text-rose-700 border-r border-slate-100">R$ {item.desconto_valor_devolucao?.toFixed(2) || '0.00'}</td>
@@ -708,18 +742,6 @@ export default function App() {
         </div>
       </main>
 
-      {/* Footer */}
-      <footer className="bg-white border-t border-slate-200 py-4 px-6">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4">
-          <p className="text-xs text-slate-400 font-medium tracking-tight">
-            © 2026 ConfNF - Inteligência Artificial Aplicada ao Compliance Fiscal.
-          </p>
-          <div className="flex items-center gap-6">
-            <a href="#" className="text-xs text-slate-400 hover:text-slate-600 transition-colors font-bold uppercase tracking-widest">Privacidade</a>
-            <a href="#" className="text-xs text-slate-400 hover:text-slate-600 transition-colors font-bold uppercase tracking-widest">Termos</a>
-          </div>
-        </div>
-      </footer>
     </div>
   );
 }
